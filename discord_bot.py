@@ -349,11 +349,44 @@ async def redeem(interaction: discord.Interaction, gift_code: str, restart: bool
         if result.returncode == 0:
             # 成功執行，獲取輸出
             output = result.stdout
-            await interaction.followup.send(f"兌換結果：\n```\n{output}\n```", ephemeral=True)
+            # 將輸出按行分割
+            lines = output.split('\n')
+            # 將輸出分段，每段不超過 1900 字元
+            messages = []
+            current_message = "兌換結果：\n```\n"
+            for line in lines:
+                if len(current_message) + len(line) + 1 > 1900:  # 加 1 為換行符
+                    current_message += "\n```"
+                    messages.append(current_message)
+                    current_message = "兌換結果（續）：\n```\n"
+                current_message += line + "\n"
+            if current_message.strip():
+                current_message += "\n```"
+                messages.append(current_message)
+
+            # 分段發送訊息
+            for message in messages:
+                await interaction.followup.send(message, ephemeral=True)
         else:
             # 執行失敗，獲取錯誤訊息
             error = result.stderr
-            await interaction.followup.send(f"兌換失敗，錯誤：\n```\n{error}\n```", ephemeral=True)
+            # 將錯誤訊息分段
+            lines = error.split('\n')
+            messages = []
+            current_message = "兌換失敗，錯誤：\n```\n"
+            for line in lines:
+                if len(current_message) + len(line) + 1 > 1900:  # 加 1 為換行符
+                    current_message += "\n```"
+                    messages.append(current_message)
+                    current_message = "兌換失敗，錯誤（續）：\n```\n"
+                current_message += line + "\n"
+            if current_message.strip():
+                current_message += "\n```"
+                messages.append(current_message)
+
+            # 分段發送錯誤訊息
+            for message in messages:
+                await interaction.followup.send(message, ephemeral=True)
     
     except Exception as e:
         await interaction.followup.send(f"執行兌換時發生錯誤：{str(e)}", ephemeral=True)
