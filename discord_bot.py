@@ -5,6 +5,8 @@ import json
 import io
 from os.path import exists
 import os
+from keep_alive import keep_alive
+import redeem_code
 
 # 設置 Discord 機器人
 intents = discord.Intents.default()
@@ -331,5 +333,19 @@ async def import_players(interaction: discord.Interaction):
     except TimeoutError:
         await interaction.followup.send("時間已過！請重新使用 `/importplayers` 指令。", ephemeral=True)
 
+# 啟動 Flask 服務（在獨立線程中運行）
+keep_alive()
+
+# 註冊兌換禮品碼命令
+redeem_code.setup(bot)
+
 # 確保檔案存在
 ensure_files_exist()
+
+# 從環境變數中讀取 DISCORD_TOKEN
+DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
+if not DISCORD_TOKEN:
+    raise ValueError("環境變數 DISCORD_TOKEN 未設置！請在環境變數中設置您的 Discord 權杖。")
+
+# 運行 Discord 機器人
+bot.run(DISCORD_TOKEN)
