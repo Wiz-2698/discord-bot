@@ -1,180 +1,199 @@
-"""
-This script redeems a gift code for players of the mobile game 
-Whiteout Survival by using their API
-
-It requires an input file that contains all player IDs and 
-tracks its progress in an output file to be able to continue
-in case it runs into errors without retrying to redeem a code
-for everyone
-"""
-
-import argparse
+import discord
+from discord import app_commands
+from discord.ext import commands
 import hashlib
 import json
 import sys
 import time
-from os.path import exists
-
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-# Handle arguments the script is called with
-parser = argparse.ArgumentParser()
-parser.add_argument("-c", "--code", required=True)
-parser.add_argument("-f", "--player-file", dest="player_file", default="player.json")
-parser.add_argument("-r", "--results-file", dest="results_file", default="results.json")
-parser.add_argument("--restart", dest="restart", action="store_true")
-args = parser.parse_args()
+def setup(bot):
+    @bot.tree.command(name="redeem", description="為所有玩家兌換禮品碼")
+    async def redeem_code(interaction: discord.Interaction, gift_code: str):
+        # 立即 defer 回應，避免交互過期
+        await interaction.response.defer(ephemeral=True)
 
-# Open and read the user files
-with open(args.player_file, encoding="utf-8") as player_file:
-    players = json.loads(player_file.read())
+        # 全局變數
+        PLAYER_FILE = "player.json"
+        RESULTS_FILE = "results.json"
+        URL = "https://wos-giftcode-api.centurygame.com/api"
+        SALT = "tB87#kPtkxqOS2"
+        HTTP_HEADER = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
 
-# Initalize results to not error if no results file exists yet
-results = []
+        # 讀取玩家和結果文件
+        try:
+            with open(PLAYER_FILE, encoding="utf-8") as player_file:
+                players = json.loads(player_file.read())
+        except FileNotFoundError:
+            await interaction.followup.send("找不到 `player.json` 文件，請檢查文件是否存在！", ephemeral=True)
+            return
+        except json.JSONDecodeError:
+            await interaction.followup.send("`player.json` 格式錯誤，請檢查內容！", ephemeral=True)
+            return
 
-# If a results file exists, load it
-if exists(args.results_file):
-    with open(args.results_file, encoding="utf-8") as results_file:
-        results = json.loads(results_file.read())
+        results = []
+        if exists(RESULTS_FILE):
+            try:
+                with open(RESULTS_FILE, encoding="utf-8") as results_file:
+                    results = json.loads(results_file.read())
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"讀取 results.json 失敗：{str(e)}")
+                await interaction.followup.send("`results.json` 格式錯誤，將創建新文件！", ephemeral=True)
+                results = []
 
-# Retrieve the result set if it exists or create an empty one
-# We make sure that we get a view of the dictionary so we can modify
-# it in our code and simply write the entire result list to file again later
-found_item = next((result for result in results if result["code"] == args.code), None)
+        # 查找或創建結果項目
+        found_item = next((result for result in results if result["code"] == gift_code), None)
+        if found_item is None:
+            print(f"New code: {gift_code} adding to results file and processing.")
+            new_item = {"code": gift_code, "status": {}}
+            results.append(new_item)
+            result = new_item
+        else:
+            result = found_item
 
-if found_item is None:
-    print("New code: " + args.code + " adding to results file and processing.")
-    new_item = {"code": args.code, "status": {}}
-    results.append(new_item)
-    result = new_item
-else:
-    result = found_item
+        # 跟踪進度
+        counter_successfully_claimed = 0
+        counter_already_claimed = 0
+        counter_error = 0
+        success_messages = []
+        already_claimed_messages = []
+        error_messages = []
 
-# Some variables that are used to tracking progress
-counter_successfully_claimed = 0
-counter_already_claimed = 0
-counter_error = 0
-
-URL = "https://wos-giftcode-api.centurygame.com/api"
-# The salt is appended to the string that is then signed using md5 and sent as part of the request
-SALT = "tB87#kPtkxqOS2"
-HTTP_HEADER = {
-    "Content-Type": "application/x-www-form-urlencoded",
-    "Accept": "application/json",
-}
-
-i = 0
-
-# Enable retry login and backoff behavior so if you have a large number of players (> 30) it'll not fail
-# Default rate limits of WOS API is 30 in 1 min.
-r = requests.Session()
-retry_config = Retry(
-    total=5, backoff_factor=1, status_forcelist=[429], allowed_methods=False
-)
-r.mount("https://", HTTPAdapter(max_retries=retry_config))
-
-for player in players:
-
-    # Print progress bar
-    i += 1
-
-    print(
-        "\x1b[K"
-        + str(i)
-        + "/"
-        + str(len(players))
-        + " complete. Redeeming for "
-        + player["original_name"],
-        end="\r",
-        flush=True,
-    )
-
-    # Check if the code has been redeemed for this player already
-    # Continue to the next iteration if it has been
-    if result["status"].get(player["id"]) == "Successful" and not args.restart:
-        counter_already_claimed += 1
-        continue
-
-    # This is necessary because we reload the page every 5 players
-    # and the website isn't sometimes ready before we continue
-    request_data = {"fid": player["id"], "time": time.time_ns()}
-    request_data["sign"] = hashlib.md5(
-        (
-            "fid=" + request_data["fid"] + "&time=" + str(request_data["time"]) + SALT
-        ).encode("utf-8")
-    ).hexdigest()
-
-    # Login the player
-    # It is enough to send the POST request, we don't need to store any cookies/session tokens
-    # to authenticate during the next request
-    login_request = r.post(
-        URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=30
-    )
-    login_response = login_request.json()
-
-    # Login failed for user, report, count error and continue gracefully to complete all other players
-    if login_response["msg"] != "success":
-        print(
-            "Login not possible for player: "
-            + player["original_name"]
-            + " / "
-            + player["id"]
-            + " - validate their player ID. Skipping."
+        # 設置重試策略（處理 API 速率限制）
+        r = requests.Session()
+        retry_config = Retry(
+            total=5, backoff_factor=1, status_forcelist=[429], allowed_methods=False
         )
-        counter_error += 1
-        continue
+        r.mount("https://", HTTPAdapter(max_retries=retry_config))
 
-    # Create the request data that contains the signature and the code
-    request_data["cdk"] = args.code
-    request_data["sign"] = hashlib.md5(
-        (
-            "cdk="
-            + request_data["cdk"]
-            + "&fid="
-            + request_data["fid"]
-            + "&time="
-            + str(request_data["time"])
-            + SALT
-        ).encode("utf-8")
-    ).hexdigest()
+        i = 0
+        for player in players:
+            i += 1
+            progress = f"\x1b[K{i}/{len(players)} complete. Redeeming for {player['original_name']}"
+            print(progress, end="\r", flush=True)
 
-    # Send the gif code redemption request
-    redeem_request = r.post(
-        URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=30
-    )
-    redeem_response = redeem_request.json()
+            # 檢查是否已兌換
+            if result["status"].get(player["id"]) == "Successful":
+                counter_already_claimed += 1
+                already_claimed_messages.append(f"玩家 {player['original_name']} 已兌換過 `{gift_code}`")
+                continue
 
-    # In case the gift code is broken, exit straight away
-    if redeem_response["err_code"] == 40014:
-        print("\nThe gift code doesn't exist!")
-        sys.exit(1)
-    elif redeem_response["err_code"] == 40007:
-        print("\nThe gift code is expired!")
-        sys.exit(1)
-    elif redeem_response["err_code"] == 40008:  # ALREADY CLAIMED
-        counter_already_claimed += 1
-        result["status"][player["id"]] = "Successful"
-    elif redeem_response["err_code"] == 20000:  # SUCCESSFULLY CLAIMED
-        counter_successfully_claimed += 1
-        result["status"][player["id"]] = "Successful"
-    elif redeem_response["err_code"] == 40004:  # TIMEOUT RETRY
-        result["status"][player["id"]] = "Unsuccessful"
-    else:
-        result["status"][player["id"]] = "Unsuccessful"
-        print("\nError occurred: " + str(redeem_response))
-        counter_error += 1
+            # 準備請求數據（玩家驗證）
+            try:
+                request_data = {"fid": player["id"], "time": time.time_ns()}
+                request_data["sign"] = hashlib.md5(
+                    (f"fid={request_data['fid']}&time={request_data['time']}{SALT}").encode("utf-8")
+                ).hexdigest()
 
-with open(args.results_file, "w", encoding="utf-8") as fp:
-    json.dump(results, fp)
+                # 玩家驗證（登入）
+                login_request = r.post(
+                    URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=30
+                )
+                login_response = login_request.json()
+            except Exception as e:
+                print(f"玩家 {player['original_name']} 驗證失敗：{str(e)}")
+                counter_error += 1
+                error_messages.append(f"玩家 {player['original_name']} 驗證失敗：{str(e)}")
+                continue
 
-# Print general stats
-print(
-    "\nSuccessfully claimed gift code for "
-    + str(counter_successfully_claimed)
-    + " players.\n"
-    + str(counter_already_claimed)
-    + " had already claimed their gift. \nErrors ocurred for "
-    + str(counter_error)
-    + " players."
-)
+            if login_response["msg"] != "success":
+                counter_error += 1
+                error_messages.append(f"玩家 {player['original_name']} 驗證失敗：{login_response.get('msg', '未知錯誤')}")
+                continue
+
+            # 兌換禮品碼（最多重試 3 次）
+            max_retries = 3
+            retry_count = 0
+            success = False
+            while retry_count < max_retries and not success:
+                try:
+                    # 準備兌換請求數據
+                    request_data["cdk"] = gift_code
+                    request_data["sign"] = hashlib.md5(
+                        (f"cdk={request_data['cdk']}&fid={request_data['fid']}&time={request_data['time']}{SALT}").encode("utf-8")
+                    ).hexdigest()
+
+                    # 兌換禮品碼
+                    redeem_request = r.post(
+                        URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=30
+                    )
+                    redeem_response = redeem_request.json()
+
+                    if redeem_response["err_code"] == 40014:  # 無效代碼
+                        await interaction.followup.send("禮品碼不存在！終止操作。", ephemeral=True)
+                        sys.exit(1)
+                    elif redeem_response["err_code"] == 40007:  # 過期代碼
+                        await interaction.followup.send("禮品碼已過期！終止操作。", ephemeral=True)
+                        sys.exit(1)
+                    elif redeem_response["err_code"] == 40008:  # 已兌換
+                        counter_already_claimed += 1
+                        result["status"][player["id"]] = "Successful"
+                        already_claimed_messages.append(f"玩家 {player['original_name']} 已兌換過 `{gift_code}`")
+                        success = True
+                    elif redeem_response["err_code"] == 20000:  # 成功兌換
+                        counter_successfully_claimed += 1
+                        result["status"][player["id"]] = "Successful"
+                        success_messages.append(f"玩家 {player['original_name']} 成功兌換 `{gift_code}`")
+                        success = True
+                    elif redeem_response["err_code"] == 40011:  # SAME TYPE EXCHANGE
+                        counter_error += 1
+                        result["status"][player["id"]] = "Unsuccessful"
+                        error_messages.append(f"玩家 {player['original_name']} 兌換失敗：已兌換相同類型的禮品碼（err_code: 40011）")
+                        success = True
+                    elif redeem_response["err_code"] == 40004:  # 超時，重試
+                        retry_count += 1
+                        if retry_count == max_retries:
+                            result["status"][player["id"]] = "Unsuccessful"
+                            error_messages.append(f"玩家 {player['original_name']} 兌換失敗（超時，重試 {max_retries} 次後仍失敗）")
+                        else:
+                            print(f"玩家 {player['original_name']} 兌換超時，第 {retry_count} 次重試...")
+                            time.sleep(1)  # 等待 1 秒後重試
+                    else:
+                        counter_error += 1
+                        result["status"][player["id"]] = "Unsuccessful"
+                        error_messages.append(f"玩家 {player['original_name']} 兌換失敗：{str(redeem_response)}")
+                        success = True
+                except Exception as e:
+                    print(f"玩家 {player['original_name']} 兌換失敗：{str(e)}")
+                    retry_count += 1
+                    if retry_count == max_retries:
+                        result["status"][player["id"]] = "Unsuccessful"
+                        error_messages.append(f"玩家 {player['original_name']} 兌換失敗（錯誤，重試 {max_retries} 次後仍失敗）：{str(e)}")
+                    else:
+                        print(f"玩家 {player['original_name']} 兌換錯誤，第 {retry_count} 次重試...")
+                        time.sleep(1)  # 等待 1 秒後重試
+
+        # 保存結果到 results.json
+        try:
+            with open(RESULTS_FILE, "w", encoding="utf-8") as fp:
+                json.dump(results, fp, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"保存 results.json 失敗：{str(e)}")
+            await interaction.followup.send(f"保存結果文件失敗：{str(e)}", ephemeral=True)
+
+        # 發送集中總結訊息
+        summary = (
+            f"兌換禮品碼 `{gift_code}` 結果：\n"
+            f"成功兌換的玩家數量：{counter_successfully_claimed}\n"
+            f"已兌換過的玩家數量：{counter_already_claimed}\n"
+            f"發生錯誤的玩家數量：{counter_error}\n\n"
+        )
+
+        if success_messages:
+            summary += "成功兌換的玩家：\n" + "\n".join(success_messages) + "\n"
+        if already_claimed_messages:
+            summary += "已兌換過的玩家：\n" + "\n".join(already_claimed_messages) + "\n"
+        if error_messages:
+            summary += "發生錯誤的玩家：\n" + "\n".join(error_messages)
+
+        # 由於 Discord 訊息長度限制（2000 字元），如果總結過長，分段發送
+        if len(summary) > 1900:  # 留點餘量避免超過
+            chunks = [summary[i:i + 1900] for i in range(0, len(summary), 1900)]
+            for chunk in chunks:
+                await interaction.followup.send(chunk, ephemeral=True)
+        else:
+            await interaction.followup.send(summary, ephemeral=True)
