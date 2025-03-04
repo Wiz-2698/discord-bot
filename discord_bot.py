@@ -7,6 +7,7 @@ from os.path import exists
 import os
 import subprocess
 from keep_alive import keep_alive
+import asyncio
 
 # 設置 Discord 機器人
 intents = discord.Intents.default()
@@ -397,10 +398,27 @@ keep_alive()
 # 確保檔案存在
 ensure_files_exist()
 
-# 從環境變數中讀取 DISCORD_TOKEN
-DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
-if not DISCORD_TOKEN:
-    raise ValueError("環境變數 DISCORD_TOKEN 未設置！請在環境變數中設置您的 Discord 權杖。")
+# 主程式：添加異常處理和自動重試
+async def run_bot_with_retry():
+    while True:
+        try:
+            print("正在啟動 Discord 機器人...")
+            # 從環境變數中讀取 DISCORD_TOKEN
+            DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
+            if not DISCORD_TOKEN:
+                raise ValueError("環境變數 DISCORD_TOKEN 未設置！請在環境變數中設置您的 Discord 權杖。")
+            # 運行 Discord 機器人
+            await bot.start(DISCORD_TOKEN)
+        except Exception as e:
+            print(f"機器人崩潰，錯誤：{str(e)}")
+            print("等待 10 秒後重新啟動...")
+            await asyncio.sleep(10)  # 等待 10 秒後重新啟動
+        except discord.errors.ConnectionClosed as e:
+            print(f"Discord 連線斷開，錯誤：{str(e)}")
+            print("等待 10 秒後重新連線...")
+            await asyncio.sleep(10)  # 等待 10 秒後重新連線
 
-# 運行 Discord 機器人
-bot.run(DISCORD_TOKEN)
+# 啟動機器人
+if __name__ == "__main__":
+    # 使用 asyncio 運行機器人以支援自動重新連線
+    asyncio.run(run_bot_with_retry())
