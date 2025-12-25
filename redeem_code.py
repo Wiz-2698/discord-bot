@@ -1,7 +1,7 @@
 """
 This script redeems a gift code for players of the mobile game
 Whiteout Survival by using their API.
-Modified to auto-retry failed attempts.
+Modified to auto-retry failed attempts with original timeout settings.
 """
 
 import argparse
@@ -54,9 +54,6 @@ HTTP_HEADER = {
     "Accept": "application/json",
 }
 
-# OCR Initialization
-ocr = ddddocr.DdddOcr(show_ad=False)
-
 # Requests Session Setup
 r = requests.Session()
 retry_config = Retry(
@@ -66,17 +63,25 @@ r.mount("https://", HTTPAdapter(max_retries=retry_config))
 
 
 def analyze_captcha_image_and_change_2_text(base64_string):
+    # Remove base64 string header
     if "," in base64_string:
         base64_string = base64_string.split(",")[1]
+
+    # Convert base64 to image data
     img_data = base64.b64decode(base64_string)
+
+    # Initialize ddddocr (Reverted to original behavior: initialize inside function)
+    ocr = ddddocr.DdddOcr(show_ad=False)
+
+    # Recognize captcha
     res = ocr.classification(img_data)
+
+    # Convert to uppercase
     return res.upper()
 
 # --- NEW: Retry Logic Variables ---
-MAX_RETRIES = 15  # 最大重試輪數
+MAX_RETRIES = 20  # 最大重試輪數
 retry_count = 0
-global_counter_successfully_claimed = 0
-global_counter_already_claimed = 0
 
 print(f"Target Code: {args.code} | Total Players: {len(players)}")
 
@@ -99,7 +104,6 @@ while retry_count < MAX_RETRIES:
         # Check status
         status = result["status"].get(player["id"])
         if status == "Successful" and not args.restart:
-            # 已經成功的直接計數跳過，不印 log 以免洗版
             continue
 
         print(
@@ -117,7 +121,8 @@ while retry_count < MAX_RETRIES:
 
         # 1. Login
         try:
-            login_request = r.post(URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=10)
+            # Reverted timeout to 30s
+            login_request = r.post(URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=30)
             login_response = login_request.json()
         except Exception as e:
             print(f"\nLogin Connection Error for {player['original_name']}: {e}")
@@ -125,8 +130,7 @@ while retry_count < MAX_RETRIES:
             continue
 
         if login_response["msg"] != "success":
-            print(f"\nLogin failed for {player['original_name']} (ID: {player['id']}). Skipping.")
-            # 登入失敗通常是 ID 錯，計入錯誤但不一定能透過重試解決，這裡仍計入 error
+            print(f"\nLogin not possible for player: {player['original_name']} / {player['id']}. Skipping.")
             errors_this_round += 1
             continue
 
@@ -137,7 +141,8 @@ while retry_count < MAX_RETRIES:
         ).hexdigest()
 
         try:
-            captcha_request = r.post(URL + "/captcha", data=captcha_data, headers=HTTP_HEADER, timeout=10)
+            # Reverted timeout to 30s
+            captcha_request = r.post(URL + "/captcha", data=captcha_data, headers=HTTP_HEADER, timeout=30)
             captcha_response = captcha_request.json()
         except Exception as e:
             print(f"\nCaptcha Connection Error for {player['original_name']}")
@@ -145,14 +150,20 @@ while retry_count < MAX_RETRIES:
             continue
 
         if captcha_response["msg"] != "SUCCESS":
-            print(f"\nCaptcha fetch failed for {player['original_name']}")
+            print(f"\nCaptcha failed for {player['original_name']}")
             errors_this_round += 1
             continue
 
         captcha_img = captcha_response["data"]["img"]
 
         # 3. Redeem
-        request_data["captcha_code"] = analyze_captcha_image_and_change_2_text(captcha_img)
+        try:
+            request_data["captcha_code"] = analyze_captcha_image_and_change_2_text(captcha_img)
+        except Exception as e:
+            print(f"\nOCR Error for {player['original_name']}: {e}")
+            errors_this_round += 1
+            continue
+
         request_data["cdk"] = args.code
         request_data["time"] = str(time.time_ns())
         request_data["sign"] = hashlib.md5(
@@ -160,7 +171,8 @@ while retry_count < MAX_RETRIES:
         ).hexdigest()
 
         try:
-            redeem_request = r.post(URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=10)
+            # Reverted timeout to 30s
+            redeem_request = r.post(URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=30)
             redeem_response = redeem_request.json()
         except Exception as e:
             print(f"\nRedeem Connection Error for {player['original_name']}")
@@ -180,13 +192,13 @@ while retry_count < MAX_RETRIES:
             result["status"][player["id"]] = "Successful"
         elif err_code == 20000: # Success
             result["status"][player["id"]] = "Successful"
-            print(f"\nSUCCESS: {player['original_name']}")
+            # 成功時不印出訊息，避免洗版，只在最後統計
         else:
             # 40004 (Timeout), 40101 (Freq), 40103 (Captcha Error) -> Retryable
             result["status"][player["id"]] = "Unsuccessful"
-            # 不要印出每一行錯誤，保持畫面整潔，除非是最後一輪
+            # 只在最後一輪印出詳細錯誤，避免中間過程太混亂
             if retry_count == MAX_RETRIES - 1:
-                print(f"\nFailed for {player['original_name']}: {redeem_response}")
+                print(f"\nError for {player['original_name']}: {redeem_response}")
             errors_this_round += 1
 
     # Save progress after each round
@@ -199,7 +211,8 @@ while retry_count < MAX_RETRIES:
     else:
         retry_count += 1
         if retry_count < MAX_RETRIES:
-            wait_time = 3 + (retry_count * 1) # 漸進式等待：3秒, 4秒, 5秒...
+            # 伺服器不穩定時，等待時間稍微拉長
+            wait_time = 2 
             print(f"\nRound finished with {errors_this_round} errors. Retrying in {wait_time}s...")
             time.sleep(wait_time)
         else:
