@@ -1,191 +1,200 @@
-"""
-This script redeems a gift code for players of the mobile game
-Whiteout Survival by using their API.
-Modified to be "Quiet" for Discord Bots (prevents disconnects).
-"""
-
-import argparse
-import hashlib
+import discord
+from discord import app_commands
+from discord.ext import commands
 import json
+import os
 import sys
-import time
-import base64
-import ddddocr
+import asyncio
 from os.path import exists
+from keep_alive import keep_alive
 
-import requests
-from requests.adapters import HTTPAdapter, Retry
+# 設置 Discord 機器人
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Handle arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("-c", "--code", required=True)
-parser.add_argument("-f", "--player-file", dest="player_file", default="player.json")
-parser.add_argument("-r", "--results-file", dest="results_file", default="results.json")
-parser.add_argument("--restart", dest="restart", action="store_true")
-args = parser.parse_args()
+# 全局變數
+PLAYER_FILE = "player.json"
 
-# Load players
-with open(args.player_file, encoding="utf-8") as player_file:
-    players = json.loads(player_file.read())
+def ensure_files_exist():
+    if not exists(PLAYER_FILE):
+        with open(PLAYER_FILE, "w", encoding="utf-8") as fp:
+            json.dump([], fp)
 
-results = []
-if exists(args.results_file):
-    with open(args.results_file, encoding="utf-8") as results_file:
-        results = json.loads(results_file.read())
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f'機器人已啟動：{bot.user}，同步了 {len(synced)} 個指令')
+    except Exception as e:
+        print(f"同步指令失敗：{e}")
 
-found_item = next((result for result in results if result["code"] == args.code), None)
+# 權限檢查
+def check_admin():
+    async def predicate(interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("您需要管理員權限才能使用此指令！", ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
 
-if found_item is None:
-    # 這裡只印簡單的一行
-    print(f"Start Processing Code: {args.code}") 
-    new_item = {"code": args.code, "status": {}}
-    results.append(new_item)
-    result = new_item
-else:
-    result = found_item
+# --- 指令區 ---
 
-URL = "https://wos-giftcode-api.centurygame.com/api"
-SALT = "tB87#kPtkxqOS2"
-HTTP_HEADER = {
-    "Content-Type": "application/x-www-form-urlencoded",
-    "Accept": "application/json",
-}
-
-r = requests.Session()
-retry_config = Retry(
-    total=5, backoff_factor=1, status_forcelist=[429], allowed_methods=False
-)
-r.mount("https://", HTTPAdapter(max_retries=retry_config))
-
-def analyze_captcha_image_and_change_2_text(base64_string):
-    if "," in base64_string:
-        base64_string = base64_string.split(",")[1]
-    img_data = base64.b64decode(base64_string)
-    ocr = ddddocr.DdddOcr(show_ad=False)
-    res = ocr.classification(img_data)
-    return res.upper()
-
-# --- RETRY LOGIC ---
-MAX_RETRIES = 20
-retry_count = 0
-
-# 為了防止機器人斷線，我們移除單個玩家的進度條顯示，只顯示回合進度
-print(f"Target: {args.code} | Players: {len(players)} | Max Retries: {MAX_RETRIES}")
-sys.stdout.flush() # 強制發送訊息給機器人
-
-while retry_count < MAX_RETRIES:
-    errors_this_round = 0
-    success_this_round = 0
-    
-    pending_players = [p for p in players if result["status"].get(p["id"]) != "Successful" or args.restart]
-    
-    if not pending_players:
-        break # 全部成功，直接結束
-
-    # 只印出回合開始，不印出每一個玩家
-    if retry_count > 0:
-        print(f"--- Retry Round {retry_count} (Left: {len(pending_players)}) ---")
-        sys.stdout.flush()
-
-    for player in players:
-        # Check status
-        status = result["status"].get(player["id"])
-        if status == "Successful" and not args.restart:
-            continue
-
-        # --- 核心邏輯開始 (完全靜默執行，不 print) ---
-        timestamp = time.time_ns()
-        request_data = {"fid": player["id"], "time": timestamp}
-        request_data["sign"] = hashlib.md5(
-            ("fid=" + request_data["fid"] + "&time=" + str(request_data["time"]) + SALT).encode("utf-8")
-        ).hexdigest()
-
-        # 1. Login
-        try:
-            login_req = r.post(URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=30)
-            login_resp = login_req.json()
-            if login_resp["msg"] != "success":
-                errors_this_round += 1
-                continue
-        except:
-            errors_this_round += 1
-            continue
-
-        # 2. Captcha
-        captcha_data = {"fid": player["id"], "time": timestamp, "init": "0"}
-        captcha_data["sign"] = hashlib.md5(
-            ("fid=" + captcha_data["fid"] + "&init=" + captcha_data["init"] + "&time=" + str(captcha_data["time"]) + SALT).encode("utf-8")
-        ).hexdigest()
-
-        try:
-            cap_req = r.post(URL + "/captcha", data=captcha_data, headers=HTTP_HEADER, timeout=30)
-            cap_resp = cap_req.json()
-            if cap_resp["msg"] != "SUCCESS":
-                errors_this_round += 1
-                continue
-            captcha_img = cap_resp["data"]["img"]
-        except:
-            errors_this_round += 1
-            continue
-
-        # 3. Redeem
-        try:
-            request_data["captcha_code"] = analyze_captcha_image_and_change_2_text(captcha_img)
-        except:
-            errors_this_round += 1
-            continue
-
-        request_data["cdk"] = args.code
-        request_data["time"] = str(time.time_ns())
-        request_data["sign"] = hashlib.md5(
-            ("captcha_code=" + request_data["captcha_code"] + "&cdk=" + request_data["cdk"] + "&fid=" + request_data["fid"] + "&time=" + str(request_data["time"]) + SALT).encode("utf-8")
-        ).hexdigest()
-
-        try:
-            redeem_req = r.post(URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=30)
-            redeem_resp = redeem_req.json()
-        except:
-            errors_this_round += 1
-            continue
-
-        # Check Result
-        err_code = redeem_resp.get("err_code")
+@bot.tree.command(name="add_player", description="添加單個玩家")
+@app_commands.describe(player_id="玩家ID", player_name="玩家名稱")
+@check_admin()
+async def add_player(interaction: discord.Interaction, player_id: str, player_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ensure_files_exist()
+        with open(PLAYER_FILE, "r", encoding="utf-8") as f:
+            players = json.load(f)
         
-        if err_code == 40014: # 不存在
-            print(f"Error: Code {args.code} invalid.")
-            sys.exit(1)
-        elif err_code == 40007: # 過期
-            print(f"Error: Code {args.code} expired.")
-            sys.exit(1)
-        elif err_code == 40008: # 已領過
-            result["status"][player["id"]] = "Successful"
-            success_this_round += 1
-        elif err_code == 20000: # 成功
-            result["status"][player["id"]] = "Successful"
-            success_this_round += 1
+        # 檢查是否重複
+        if any(p['id'] == player_id for p in players):
+            await interaction.followup.send(f"玩家 ID {player_id} 已經存在！", ephemeral=True)
+            return
+
+        players.append({"id": player_id, "original_name": player_name})
+        
+        with open(PLAYER_FILE, "w", encoding="utf-8") as f:
+            json.dump(players, f, ensure_ascii=False, indent=4)
+            
+        await interaction.followup.send(f"已添加玩家：{player_name} ({player_id})", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"發生錯誤：{str(e)}", ephemeral=True)
+
+@bot.tree.command(name="remove_player", description="移除單個玩家")
+@app_commands.describe(player_id="玩家ID")
+@check_admin()
+async def remove_player(interaction: discord.Interaction, player_id: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ensure_files_exist()
+        with open(PLAYER_FILE, "r", encoding="utf-8") as f:
+            players = json.load(f)
+        
+        initial_count = len(players)
+        # 過濾掉該 ID
+        players = [p for p in players if p['id'] != player_id]
+        
+        if len(players) == initial_count:
+            await interaction.followup.send(f"找不到 ID 為 {player_id} 的玩家。", ephemeral=True)
+            return
+
+        with open(PLAYER_FILE, "w", encoding="utf-8") as f:
+            json.dump(players, f, ensure_ascii=False, indent=4)
+            
+        await interaction.followup.send(f"已移除玩家 ID：{player_id}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"發生錯誤：{str(e)}", ephemeral=True)
+
+@bot.tree.command(name="list_players", description="列出所有玩家")
+@check_admin()
+async def list_players(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ensure_files_exist()
+        with open(PLAYER_FILE, "r", encoding="utf-8") as f:
+            players = json.load(f)
+            
+        if not players:
+            await interaction.followup.send("目前沒有玩家名單。", ephemeral=True)
+            return
+
+        # 因為名單可能很長，我們製作成文字檔發送，或是分段發送
+        # 這裡選擇分段發送，每段最多顯示 10-15 人，避免洗版，或者直接發送總數
+        
+        count = len(players)
+        msg = f"**目前名單共 {count} 人**：\n"
+        
+        # 為了避免超過 Discord 2000字限制，如果人太多，建議只顯示前幾名或存成檔案
+        if count > 50:
+            # 人數多時，生成一個臨時文件發送
+            filename = "player_list.txt"
+            with open(filename, "w", encoding="utf-8") as f:
+                for p in players:
+                    f.write(f"{p['original_name']} ({p['id']})\n")
+            
+            await interaction.followup.send(f"人數眾多 ({count} 人)，請查看附件檔案：", file=discord.File(filename), ephemeral=True)
         else:
-            result["status"][player["id"]] = "Unsuccessful"
-            errors_this_round += 1
-        # --- 核心邏輯結束 ---
+            # 人數少時直接顯示
+            for p in players:
+                msg += f"- {p['original_name']} ({p['id']})\n"
+            await interaction.followup.send(msg, ephemeral=True)
 
-    # Save
-    with open(args.results_file, "w", encoding="utf-8") as fp:
-        json.dump(results, fp)
+    except Exception as e:
+        await interaction.followup.send(f"發生錯誤：{str(e)}", ephemeral=True)
 
-    # Round Summary (這裡才印出東西)
-    if errors_this_round == 0:
-        break
-    else:
-        retry_count += 1
-        if retry_count < MAX_RETRIES:
-            print(f"Round Result -> Success: {success_this_round}, Failed: {errors_this_round}. Retrying in 2s...")
-            sys.stdout.flush() # 確保訊息送出
-            time.sleep(2)
-        else:
-            print(f"Stopping. Remaining Failures: {errors_this_round}")
+@bot.tree.command(name="redeem", description="開始兌換禮包碼 (背景執行)")
+@app_commands.describe(code="禮包碼")
+@check_admin()
+async def redeem(interaction: discord.Interaction, code: str):
+    # 1. 回應 Discord 防止超時
+    await interaction.response.send_message(f"🚀 開始為所有玩家兌換代碼：**{code}**\n機器人將在背景運行，請耐心等待...", ephemeral=True)
+    
+    # 2. 非阻塞執行 (防止斷線的核心)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "redeem_code.py", "-c", code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
 
-# Final Output
-final_success = sum(1 for p in players if result["status"].get(p["id"]) == "Successful")
-final_errors = len(players) - final_success
+        output_buffer = ""
+        
+        # 3. 即時讀取輸出
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            
+            decoded_line = line.decode('utf-8').strip()
+            if decoded_line:
+                print(f"[Script]: {decoded_line}") 
+                output_buffer += decoded_line + "\n"
 
-print(f"\n=== FINAL: Success {final_success} / Failed {final_errors} ===")
+                # 只有在回合結束或程式結束時才更新訊息
+                if "Round" in decoded_line or "FINAL" in decoded_line:
+                    try:
+                        # 擷取最後 1000 字元避免過長
+                        display_text = output_buffer[-1000:]
+                        await interaction.edit_original_response(content=f"🔄 執行中... **{code}**\n```\n{display_text}\n```")
+                    except:
+                        pass 
+
+        await process.wait()
+        
+        # 讀取錯誤
+        stderr_data = await process.stderr.read()
+        if stderr_data:
+            output_buffer += f"\n[Errors]:\n{stderr_data.decode('utf-8')}"
+
+        # 4. 最終報告
+        final_message = f"✅ **兌換結束！** 代碼：{code}\n詳細結果：\n```\n{output_buffer[-1900:]}\n```"
+        
+        try:
+            await interaction.followup.send(final_message, ephemeral=True)
+        except:
+            await interaction.edit_original_response(content=final_message)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ 執行錯誤：{str(e)}", ephemeral=True)
+
+# 啟動 Flask 保持活躍
+keep_alive()
+ensure_files_exist()
+
+# 啟動機器人
+async def main():
+    token = os.environ.get('DISCORD_TOKEN')
+    if not token:
+        print("錯誤：找不到 DISCORD_TOKEN 環境變數")
+        return
+    await bot.start(token)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
