@@ -1,7 +1,7 @@
 """
 This script redeems a gift code for players of the mobile game
 Whiteout Survival by using their API.
-Modified to auto-retry failed attempts with original timeout settings.
+Modified to be "Quiet" for Discord Bots (prevents disconnects).
 """
 
 import argparse
@@ -16,7 +16,7 @@ from os.path import exists
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-# Handle arguments the script is called with
+# Handle arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("-c", "--code", required=True)
 parser.add_argument("-f", "--player-file", dest="player_file", default="player.json")
@@ -24,23 +24,20 @@ parser.add_argument("-r", "--results-file", dest="results_file", default="result
 parser.add_argument("--restart", dest="restart", action="store_true")
 args = parser.parse_args()
 
-# Open and read the user files
+# Load players
 with open(args.player_file, encoding="utf-8") as player_file:
     players = json.loads(player_file.read())
 
-# Initalize results to not error if no results file exists yet
 results = []
-
-# If a results file exists, load it
 if exists(args.results_file):
     with open(args.results_file, encoding="utf-8") as results_file:
         results = json.loads(results_file.read())
 
-# Retrieve the result set if it exists or create an empty one
 found_item = next((result for result in results if result["code"] == args.code), None)
 
 if found_item is None:
-    print("New code: " + args.code + " adding to results file and processing.")
+    # 這裡只印簡單的一行
+    print(f"Start Processing Code: {args.code}") 
     new_item = {"code": args.code, "status": {}}
     results.append(new_item)
     result = new_item
@@ -54,65 +51,49 @@ HTTP_HEADER = {
     "Accept": "application/json",
 }
 
-# Requests Session Setup
 r = requests.Session()
 retry_config = Retry(
     total=5, backoff_factor=1, status_forcelist=[429], allowed_methods=False
 )
 r.mount("https://", HTTPAdapter(max_retries=retry_config))
 
-
 def analyze_captcha_image_and_change_2_text(base64_string):
-    # Remove base64 string header
     if "," in base64_string:
         base64_string = base64_string.split(",")[1]
-
-    # Convert base64 to image data
     img_data = base64.b64decode(base64_string)
-
-    # Initialize ddddocr (Reverted to original behavior: initialize inside function)
     ocr = ddddocr.DdddOcr(show_ad=False)
-
-    # Recognize captcha
     res = ocr.classification(img_data)
-
-    # Convert to uppercase
     return res.upper()
 
-# --- NEW: Retry Logic Variables ---
-MAX_RETRIES = 20  # 最大重試輪數
+# --- RETRY LOGIC ---
+MAX_RETRIES = 20
 retry_count = 0
 
-print(f"Target Code: {args.code} | Total Players: {len(players)}")
+# 為了防止機器人斷線，我們移除單個玩家的進度條顯示，只顯示回合進度
+print(f"Target: {args.code} | Players: {len(players)} | Max Retries: {MAX_RETRIES}")
+sys.stdout.flush() # 強制發送訊息給機器人
 
 while retry_count < MAX_RETRIES:
     errors_this_round = 0
-    i = 0
+    success_this_round = 0
     
-    # 計算還剩多少人未成功
     pending_players = [p for p in players if result["status"].get(p["id"]) != "Successful" or args.restart]
+    
     if not pending_players:
-        print("\nAll players have successfully claimed the code!")
-        break
+        break # 全部成功，直接結束
 
+    # 只印出回合開始，不印出每一個玩家
     if retry_count > 0:
-        print(f"\n--- Retry Round {retry_count} --- (Remaining: {len(pending_players)})")
+        print(f"--- Retry Round {retry_count} (Left: {len(pending_players)}) ---")
+        sys.stdout.flush()
 
     for player in players:
-        i += 1
-        
         # Check status
         status = result["status"].get(player["id"])
         if status == "Successful" and not args.restart:
             continue
 
-        print(
-            f"\x1b[K[{i}/{len(players)}] Redeeming for {player['original_name']}...",
-            end="\r",
-            flush=True,
-        )
-
-        # Time logic
+        # --- 核心邏輯開始 (完全靜默執行，不 print) ---
         timestamp = time.time_ns()
         request_data = {"fid": player["id"], "time": timestamp}
         request_data["sign"] = hashlib.md5(
@@ -121,16 +102,12 @@ while retry_count < MAX_RETRIES:
 
         # 1. Login
         try:
-            # Reverted timeout to 30s
-            login_request = r.post(URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=30)
-            login_response = login_request.json()
-        except Exception as e:
-            print(f"\nLogin Connection Error for {player['original_name']}: {e}")
-            errors_this_round += 1
-            continue
-
-        if login_response["msg"] != "success":
-            print(f"\nLogin not possible for player: {player['original_name']} / {player['id']}. Skipping.")
+            login_req = r.post(URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=30)
+            login_resp = login_req.json()
+            if login_resp["msg"] != "success":
+                errors_this_round += 1
+                continue
+        except:
             errors_this_round += 1
             continue
 
@@ -141,26 +118,20 @@ while retry_count < MAX_RETRIES:
         ).hexdigest()
 
         try:
-            # Reverted timeout to 30s
-            captcha_request = r.post(URL + "/captcha", data=captcha_data, headers=HTTP_HEADER, timeout=30)
-            captcha_response = captcha_request.json()
-        except Exception as e:
-            print(f"\nCaptcha Connection Error for {player['original_name']}")
+            cap_req = r.post(URL + "/captcha", data=captcha_data, headers=HTTP_HEADER, timeout=30)
+            cap_resp = cap_req.json()
+            if cap_resp["msg"] != "SUCCESS":
+                errors_this_round += 1
+                continue
+            captcha_img = cap_resp["data"]["img"]
+        except:
             errors_this_round += 1
             continue
-
-        if captcha_response["msg"] != "SUCCESS":
-            print(f"\nCaptcha failed for {player['original_name']}")
-            errors_this_round += 1
-            continue
-
-        captcha_img = captcha_response["data"]["img"]
 
         # 3. Redeem
         try:
             request_data["captcha_code"] = analyze_captcha_image_and_change_2_text(captcha_img)
-        except Exception as e:
-            print(f"\nOCR Error for {player['original_name']}: {e}")
+        except:
             errors_this_round += 1
             continue
 
@@ -171,60 +142,50 @@ while retry_count < MAX_RETRIES:
         ).hexdigest()
 
         try:
-            # Reverted timeout to 30s
-            redeem_request = r.post(URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=30)
-            redeem_response = redeem_request.json()
-        except Exception as e:
-            print(f"\nRedeem Connection Error for {player['original_name']}")
+            redeem_req = r.post(URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=30)
+            redeem_resp = redeem_req.json()
+        except:
             errors_this_round += 1
             continue
 
-        # Handle Responses
-        err_code = redeem_response.get("err_code")
+        # Check Result
+        err_code = redeem_resp.get("err_code")
         
-        if err_code == 40014: # Code doesn't exist
-            print(f"\nThe gift code {args.code} doesn't exist!")
+        if err_code == 40014: # 不存在
+            print(f"Error: Code {args.code} invalid.")
             sys.exit(1)
-        elif err_code == 40007: # Expired
-            print(f"\nThe gift code {args.code} is expired!")
+        elif err_code == 40007: # 過期
+            print(f"Error: Code {args.code} expired.")
             sys.exit(1)
-        elif err_code == 40008: # Already claimed
+        elif err_code == 40008: # 已領過
             result["status"][player["id"]] = "Successful"
-        elif err_code == 20000: # Success
+            success_this_round += 1
+        elif err_code == 20000: # 成功
             result["status"][player["id"]] = "Successful"
-            # 成功時不印出訊息，避免洗版，只在最後統計
+            success_this_round += 1
         else:
-            # 40004 (Timeout), 40101 (Freq), 40103 (Captcha Error) -> Retryable
             result["status"][player["id"]] = "Unsuccessful"
-            # 只在最後一輪印出詳細錯誤，避免中間過程太混亂
-            if retry_count == MAX_RETRIES - 1:
-                print(f"\nError for {player['original_name']}: {redeem_response}")
             errors_this_round += 1
+        # --- 核心邏輯結束 ---
 
-    # Save progress after each round
+    # Save
     with open(args.results_file, "w", encoding="utf-8") as fp:
         json.dump(results, fp)
 
-    # Check if we need to loop again
+    # Round Summary (這裡才印出東西)
     if errors_this_round == 0:
         break
     else:
         retry_count += 1
         if retry_count < MAX_RETRIES:
-            # 伺服器不穩定時，等待時間稍微拉長
-            wait_time = 2 
-            print(f"\nRound finished with {errors_this_round} errors. Retrying in {wait_time}s...")
-            time.sleep(wait_time)
+            print(f"Round Result -> Success: {success_this_round}, Failed: {errors_this_round}. Retrying in 2s...")
+            sys.stdout.flush() # 確保訊息送出
+            time.sleep(2)
         else:
-            print(f"\nMax retries reached. Stopping with {errors_this_round} errors remaining.")
+            print(f"Stopping. Remaining Failures: {errors_this_round}")
 
-# Final Stats Calculation
+# Final Output
 final_success = sum(1 for p in players if result["status"].get(p["id"]) == "Successful")
 final_errors = len(players) - final_success
 
-print(
-    f"\n\n=== FINAL RESULTS ===\n"
-    f"Total Players: {len(players)}\n"
-    f"Successful: {final_success}\n"
-    f"Failed: {final_errors}"
-)
+print(f"\n=== FINAL: Success {final_success} / Failed {final_errors} ===")
