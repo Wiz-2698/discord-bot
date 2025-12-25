@@ -1,11 +1,7 @@
 """
 This script redeems a gift code for players of the mobile game
-Whiteout Survival by using their API
-
-It requires an input file that contains all player IDs and
-tracks its progress in an output file to be able to continue
-in case it runs into errors without retrying to redeem a code
-for everyone
+Whiteout Survival by using their API.
+Modified to auto-retry failed attempts.
 """
 
 import argparse
@@ -41,8 +37,6 @@ if exists(args.results_file):
         results = json.loads(results_file.read())
 
 # Retrieve the result set if it exists or create an empty one
-# We make sure that we get a view of the dictionary so we can modify
-# it in our code and simply write the entire result list to file again later
 found_item = next((result for result in results if result["code"] == args.code), None)
 
 if found_item is None:
@@ -53,23 +47,17 @@ if found_item is None:
 else:
     result = found_item
 
-# Some variables that are used to tracking progress
-counter_successfully_claimed = 0
-counter_already_claimed = 0
-counter_error = 0
-
 URL = "https://wos-giftcode-api.centurygame.com/api"
-# The salt is appended to the string that is then signed using md5 and sent as part of the request
 SALT = "tB87#kPtkxqOS2"
 HTTP_HEADER = {
     "Content-Type": "application/x-www-form-urlencoded",
     "Accept": "application/json",
 }
 
-i = 0
+# OCR Initialization
+ocr = ddddocr.DdddOcr(show_ad=False)
 
-# Enable retry login and backoff behavior so if you have a large number of players (> 30) it'll not fail
-# Default rate limits of WOS API is 30 in 1 min.
+# Requests Session Setup
 r = requests.Session()
 retry_config = Retry(
     total=5, backoff_factor=1, status_forcelist=[429], allowed_methods=False
@@ -78,168 +66,152 @@ r.mount("https://", HTTPAdapter(max_retries=retry_config))
 
 
 def analyze_captcha_image_and_change_2_text(base64_string):
-    # Remove base64 string header
     if "," in base64_string:
         base64_string = base64_string.split(",")[1]
-
-    # Convert base64 to image data
     img_data = base64.b64decode(base64_string)
+    res = ocr.classification(img_data)
+    return res.upper()
 
-    # Initialize ddddocr
-    ocr = ddddocr.DdddOcr(show_ad=False)
+# --- NEW: Retry Logic Variables ---
+MAX_RETRIES = 15  # 最大重試輪數
+retry_count = 0
+global_counter_successfully_claimed = 0
+global_counter_already_claimed = 0
 
-    # Recognize captcha
-    result = ocr.classification(img_data)
+print(f"Target Code: {args.code} | Total Players: {len(players)}")
 
-    # Convert to uppercase
-    text = result.upper()
+while retry_count < MAX_RETRIES:
+    errors_this_round = 0
+    i = 0
+    
+    # 計算還剩多少人未成功
+    pending_players = [p for p in players if result["status"].get(p["id"]) != "Successful" or args.restart]
+    if not pending_players:
+        print("\nAll players have successfully claimed the code!")
+        break
 
-    return text
+    if retry_count > 0:
+        print(f"\n--- Retry Round {retry_count} --- (Remaining: {len(pending_players)})")
 
+    for player in players:
+        i += 1
+        
+        # Check status
+        status = result["status"].get(player["id"])
+        if status == "Successful" and not args.restart:
+            # 已經成功的直接計數跳過，不印 log 以免洗版
+            continue
 
-for player in players:
-
-    # Print progress bar
-    i += 1
-
-    print(
-        "\x1b[K"
-        + str(i)
-        + "/"
-        + str(len(players))
-        + " complete. Redeeming for "
-        + player["original_name"],
-        end="\r",
-        flush=True,
-    )
-
-    # Check if the code has been redeemed for this player already
-    # Continue to the next iteration if it has been
-    if result["status"].get(player["id"]) == "Successful" and not args.restart:
-        counter_already_claimed += 1
-        continue
-
-    # This is necessary because we reload the page every 5 players
-    # and the website isn't sometimes ready before we continue
-    timestamp = time.time_ns()
-    request_data = {"fid": player["id"], "time": timestamp}
-    request_data["sign"] = hashlib.md5(
-        (
-            "fid=" + request_data["fid"] + "&time=" + str(request_data["time"]) + SALT
-        ).encode("utf-8")
-    ).hexdigest()
-
-    # Login the player
-    # It is enough to send the POST request, we don't need to store any cookies/session tokens
-    # to authenticate during the next request
-    login_request = r.post(
-        URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=30
-    )
-    login_response = login_request.json()
-
-    # Login failed for user, report, count error and continue gracefully to complete all other players
-    if login_response["msg"] != "success":
         print(
-            "Login not possible for player: "
-            + player["original_name"]
-            + " / "
-            + player["id"]
-            + " - validate their player ID. Skipping."
+            f"\x1b[K[{i}/{len(players)}] Redeeming for {player['original_name']}...",
+            end="\r",
+            flush=True,
         )
-        counter_error += 1
-        continue
 
-    captcha_data = {"fid": player["id"], "time": timestamp, "init": "0"}
-    captcha_data["sign"] = hashlib.md5(
-        (
-            "fid="
-            + captcha_data["fid"]
-            + "&init="
-            + captcha_data["init"]
-            + "&time="
-            + str(captcha_data["time"])
-            + SALT
-        ).encode("utf-8")
-    ).hexdigest()
+        # Time logic
+        timestamp = time.time_ns()
+        request_data = {"fid": player["id"], "time": timestamp}
+        request_data["sign"] = hashlib.md5(
+            ("fid=" + request_data["fid"] + "&time=" + str(request_data["time"]) + SALT).encode("utf-8")
+        ).hexdigest()
 
-    # Login the player - get captcha
-    captcha_request = r.post(
-        URL + "/captcha", data=captcha_data, headers=HTTP_HEADER, timeout=30
-    )
-    captcha_response = captcha_request.json()
+        # 1. Login
+        try:
+            login_request = r.post(URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=10)
+            login_response = login_request.json()
+        except Exception as e:
+            print(f"\nLogin Connection Error for {player['original_name']}: {e}")
+            errors_this_round += 1
+            continue
 
-    # Login failed for user, report, count error and continue gracefully to complete all other players
-    if captcha_response["msg"] != "SUCCESS":
-        print(
-            "Login not possible for player: "
-            + player["original_name"]
-            + " / "
-            + player["id"]
-            + " - Captcha failed. Skipping."
-        )
-        counter_error += 1
-        continue
+        if login_response["msg"] != "success":
+            print(f"\nLogin failed for {player['original_name']} (ID: {player['id']}). Skipping.")
+            # 登入失敗通常是 ID 錯，計入錯誤但不一定能透過重試解決，這裡仍計入 error
+            errors_this_round += 1
+            continue
 
-    captcha_img = captcha_response["data"]["img"]
+        # 2. Captcha
+        captcha_data = {"fid": player["id"], "time": timestamp, "init": "0"}
+        captcha_data["sign"] = hashlib.md5(
+            ("fid=" + captcha_data["fid"] + "&init=" + captcha_data["init"] + "&time=" + str(captcha_data["time"]) + SALT).encode("utf-8")
+        ).hexdigest()
 
-    # Create the request data that contains the signature and the code
-    request_data["captcha_code"] = analyze_captcha_image_and_change_2_text(captcha_img)
-    request_data["cdk"] = args.code
-    request_data["time"] = str(time.time_ns())
-    request_data["sign"] = hashlib.md5(
-        (
-            "captcha_code="
-            + request_data["captcha_code"]
-            + "&cdk="
-            + request_data["cdk"]
-            + "&fid="
-            + request_data["fid"]
-            + "&time="
-            + str(request_data["time"])
-            + SALT
-        ).encode("utf-8")
-    ).hexdigest()
+        try:
+            captcha_request = r.post(URL + "/captcha", data=captcha_data, headers=HTTP_HEADER, timeout=10)
+            captcha_response = captcha_request.json()
+        except Exception as e:
+            print(f"\nCaptcha Connection Error for {player['original_name']}")
+            errors_this_round += 1
+            continue
 
-    # Send the gif code redemption request
-    redeem_request = r.post(
-        URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=30
-    )
-    redeem_response = redeem_request.json()
+        if captcha_response["msg"] != "SUCCESS":
+            print(f"\nCaptcha fetch failed for {player['original_name']}")
+            errors_this_round += 1
+            continue
 
-    # In case the gift code is broken, exit straight away
-    if redeem_response["err_code"] == 40014:
-        print("\nThe gift code doesn't exist!")
-        sys.exit(1)
-    elif redeem_response["err_code"] == 40007:
-        print("\nThe gift code is expired!")
-        sys.exit(1)
-    elif redeem_response["err_code"] == 40008:  # ALREADY CLAIMED
-        counter_already_claimed += 1
-        result["status"][player["id"]] = "Successful"
-    elif redeem_response["err_code"] == 20000:  # SUCCESSFULLY CLAIMED
-        counter_successfully_claimed += 1
-        result["status"][player["id"]] = "Successful"
-    elif redeem_response["err_code"] == 40004:  # TIMEOUT RETRY
-        result["status"][player["id"]] = "Unsuccessful"
-    elif redeem_response["err_code"] == 40101:  # CAPTCHA CHECK TOO FREQUENT.
-        result["status"][player["id"]] = "Unsuccessful"
-    elif redeem_response["err_code"] == 40103:  # CAPTCHA CHECK ERROR.
-        result["status"][player["id"]] = "Unsuccessful"
+        captcha_img = captcha_response["data"]["img"]
+
+        # 3. Redeem
+        request_data["captcha_code"] = analyze_captcha_image_and_change_2_text(captcha_img)
+        request_data["cdk"] = args.code
+        request_data["time"] = str(time.time_ns())
+        request_data["sign"] = hashlib.md5(
+            ("captcha_code=" + request_data["captcha_code"] + "&cdk=" + request_data["cdk"] + "&fid=" + request_data["fid"] + "&time=" + str(request_data["time"]) + SALT).encode("utf-8")
+        ).hexdigest()
+
+        try:
+            redeem_request = r.post(URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=10)
+            redeem_response = redeem_request.json()
+        except Exception as e:
+            print(f"\nRedeem Connection Error for {player['original_name']}")
+            errors_this_round += 1
+            continue
+
+        # Handle Responses
+        err_code = redeem_response.get("err_code")
+        
+        if err_code == 40014: # Code doesn't exist
+            print(f"\nThe gift code {args.code} doesn't exist!")
+            sys.exit(1)
+        elif err_code == 40007: # Expired
+            print(f"\nThe gift code {args.code} is expired!")
+            sys.exit(1)
+        elif err_code == 40008: # Already claimed
+            result["status"][player["id"]] = "Successful"
+        elif err_code == 20000: # Success
+            result["status"][player["id"]] = "Successful"
+            print(f"\nSUCCESS: {player['original_name']}")
+        else:
+            # 40004 (Timeout), 40101 (Freq), 40103 (Captcha Error) -> Retryable
+            result["status"][player["id"]] = "Unsuccessful"
+            # 不要印出每一行錯誤，保持畫面整潔，除非是最後一輪
+            if retry_count == MAX_RETRIES - 1:
+                print(f"\nFailed for {player['original_name']}: {redeem_response}")
+            errors_this_round += 1
+
+    # Save progress after each round
+    with open(args.results_file, "w", encoding="utf-8") as fp:
+        json.dump(results, fp)
+
+    # Check if we need to loop again
+    if errors_this_round == 0:
+        break
     else:
-        result["status"][player["id"]] = "Unsuccessful"
-        print("\nError occurred: " + str(redeem_response))
-        counter_error += 1
+        retry_count += 1
+        if retry_count < MAX_RETRIES:
+            wait_time = 3 + (retry_count * 1) # 漸進式等待：3秒, 4秒, 5秒...
+            print(f"\nRound finished with {errors_this_round} errors. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+        else:
+            print(f"\nMax retries reached. Stopping with {errors_this_round} errors remaining.")
 
-with open(args.results_file, "w", encoding="utf-8") as fp:
-    json.dump(results, fp)
+# Final Stats Calculation
+final_success = sum(1 for p in players if result["status"].get(p["id"]) == "Successful")
+final_errors = len(players) - final_success
 
-# Print general stats
 print(
-    "\nSuccessfully claimed gift code for "
-    + str(counter_successfully_claimed)
-    + " players.\n"
-    + str(counter_already_claimed)
-    + " had already claimed their gift. \nErrors ocurred for "
-    + str(counter_error)
-    + " players."
+    f"\n\n=== FINAL RESULTS ===\n"
+    f"Total Players: {len(players)}\n"
+    f"Successful: {final_success}\n"
+    f"Failed: {final_errors}"
 )
