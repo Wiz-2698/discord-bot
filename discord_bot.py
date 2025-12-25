@@ -64,15 +64,76 @@ async def add_player(interaction: discord.Interaction, player_id: str, player_na
     except Exception as e:
         await interaction.followup.send(f"發生錯誤：{str(e)}", ephemeral=True)
 
-@bot.tree.command(name="redeem", description="開始兌換禮包碼 (支援自動重試)")
+@bot.tree.command(name="remove_player", description="移除單個玩家")
+@app_commands.describe(player_id="玩家ID")
+@check_admin()
+async def remove_player(interaction: discord.Interaction, player_id: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ensure_files_exist()
+        with open(PLAYER_FILE, "r", encoding="utf-8") as f:
+            players = json.load(f)
+        
+        initial_count = len(players)
+        # 過濾掉該 ID
+        players = [p for p in players if p['id'] != player_id]
+        
+        if len(players) == initial_count:
+            await interaction.followup.send(f"找不到 ID 為 {player_id} 的玩家。", ephemeral=True)
+            return
+
+        with open(PLAYER_FILE, "w", encoding="utf-8") as f:
+            json.dump(players, f, ensure_ascii=False, indent=4)
+            
+        await interaction.followup.send(f"已移除玩家 ID：{player_id}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"發生錯誤：{str(e)}", ephemeral=True)
+
+@bot.tree.command(name="list_players", description="列出所有玩家")
+@check_admin()
+async def list_players(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ensure_files_exist()
+        with open(PLAYER_FILE, "r", encoding="utf-8") as f:
+            players = json.load(f)
+            
+        if not players:
+            await interaction.followup.send("目前沒有玩家名單。", ephemeral=True)
+            return
+
+        # 因為名單可能很長，我們製作成文字檔發送，或是分段發送
+        # 這裡選擇分段發送，每段最多顯示 10-15 人，避免洗版，或者直接發送總數
+        
+        count = len(players)
+        msg = f"**目前名單共 {count} 人**：\n"
+        
+        # 為了避免超過 Discord 2000字限制，如果人太多，建議只顯示前幾名或存成檔案
+        if count > 50:
+            # 人數多時，生成一個臨時文件發送
+            filename = "player_list.txt"
+            with open(filename, "w", encoding="utf-8") as f:
+                for p in players:
+                    f.write(f"{p['original_name']} ({p['id']})\n")
+            
+            await interaction.followup.send(f"人數眾多 ({count} 人)，請查看附件檔案：", file=discord.File(filename), ephemeral=True)
+        else:
+            # 人數少時直接顯示
+            for p in players:
+                msg += f"- {p['original_name']} ({p['id']})\n"
+            await interaction.followup.send(msg, ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"發生錯誤：{str(e)}", ephemeral=True)
+
+@bot.tree.command(name="redeem", description="開始兌換禮包碼 (背景執行)")
 @app_commands.describe(code="禮包碼")
 @check_admin()
 async def redeem(interaction: discord.Interaction, code: str):
-    # 1. 告訴 Discord 我們收到了，請稍等（這很重要，防止 3 秒超時）
-    await interaction.response.send_message(f"🚀 開始為所有玩家兌換代碼：**{code}**\n這可能需要幾分鐘，機器人將在背景運行，請勿重複執行...", ephemeral=True)
+    # 1. 回應 Discord 防止超時
+    await interaction.response.send_message(f"🚀 開始為所有玩家兌換代碼：**{code}**\n機器人將在背景運行，請耐心等待...", ephemeral=True)
     
-    # 2. 使用 asyncio.create_subprocess_exec 非阻塞地執行外部程式
-    # 這是關鍵：這樣機器人本體不會卡死，可以繼續發送心跳包
+    # 2. 非阻塞執行 (防止斷線的核心)
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable, "redeem_code.py", "-c", code,
@@ -80,48 +141,45 @@ async def redeem(interaction: discord.Interaction, code: str):
             stderr=asyncio.subprocess.PIPE
         )
 
-        # 準備一個變數來收集輸出
         output_buffer = ""
         
-        # 3. 即時讀取輸出 (不會卡住機器人)
+        # 3. 即時讀取輸出
         while True:
-            # 讀取一行
             line = await process.stdout.readline()
             if not line:
                 break
             
             decoded_line = line.decode('utf-8').strip()
             if decoded_line:
-                print(f"[Script]: {decoded_line}") # 在後台終端印出以便除錯
+                print(f"[Script]: {decoded_line}") 
                 output_buffer += decoded_line + "\n"
 
-                # 如果是有意義的進度訊息（包含 Round 或 FINAL），我們可以嘗試編輯訊息通知用戶
-                # 注意：不能太頻繁編輯訊息，不然會被 Discord 限制
+                # 只有在回合結束或程式結束時才更新訊息
                 if "Round" in decoded_line or "FINAL" in decoded_line:
                     try:
-                        await interaction.edit_original_response(content=f"🔄 執行中... **{code}**\n```\n{output_buffer[-1000:]}\n```") # 只顯示最後 1000 字避免過長
+                        # 擷取最後 1000 字元避免過長
+                        display_text = output_buffer[-1000:]
+                        await interaction.edit_original_response(content=f"🔄 執行中... **{code}**\n```\n{display_text}\n```")
                     except:
-                        pass # 如果編輯失敗就算了，不影響流程
+                        pass 
 
-        # 等待程式完全結束
         await process.wait()
         
-        # 讀取錯誤輸出（如果有）
+        # 讀取錯誤
         stderr_data = await process.stderr.read()
         if stderr_data:
             output_buffer += f"\n[Errors]:\n{stderr_data.decode('utf-8')}"
 
-        # 4. 最終結果報告
-        final_message = f"✅ **兌換結束！** 代碼：{code}\n詳細結果：\n```\n{output_buffer[-1900:]}\n```" # 限制長度以免超過 Discord 上限
+        # 4. 最終報告
+        final_message = f"✅ **兌換結束！** 代碼：{code}\n詳細結果：\n```\n{output_buffer[-1900:]}\n```"
         
         try:
             await interaction.followup.send(final_message, ephemeral=True)
         except:
-            # 如果原本的互動過期，嘗試用編輯的
             await interaction.edit_original_response(content=final_message)
 
     except Exception as e:
-        await interaction.followup.send(f"❌ 執行時發生嚴重錯誤：{str(e)}", ephemeral=True)
+        await interaction.followup.send(f"❌ 執行錯誤：{str(e)}", ephemeral=True)
 
 # 啟動 Flask 保持活躍
 keep_alive()
