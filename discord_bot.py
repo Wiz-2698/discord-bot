@@ -101,30 +101,120 @@ async def list_players(interaction: discord.Interaction):
         if not players:
             await interaction.followup.send("目前沒有玩家名單。", ephemeral=True)
             return
-
-        # 因為名單可能很長，我們製作成文字檔發送，或是分段發送
-        # 這裡選擇分段發送，每段最多顯示 10-15 人，避免洗版，或者直接發送總數
         
         count = len(players)
         msg = f"**目前名單共 {count} 人**：\n"
         
-        # 為了避免超過 Discord 2000字限制，如果人太多，建議只顯示前幾名或存成檔案
         if count > 50:
-            # 人數多時，生成一個臨時文件發送
-            filename = "player_list.txt"
+            filename = "player_list_temp.txt"
             with open(filename, "w", encoding="utf-8") as f:
                 for p in players:
                     f.write(f"{p['original_name']} ({p['id']})\n")
             
             await interaction.followup.send(f"人數眾多 ({count} 人)，請查看附件檔案：", file=discord.File(filename), ephemeral=True)
         else:
-            # 人數少時直接顯示
             for p in players:
                 msg += f"- {p['original_name']} ({p['id']})\n"
             await interaction.followup.send(msg, ephemeral=True)
 
     except Exception as e:
         await interaction.followup.send(f"發生錯誤：{str(e)}", ephemeral=True)
+
+# ===== 新增功能區 =====
+
+@bot.tree.command(name="export_players", description="匯出 player.json 檔案 (方便備份至 GitHub)")
+@check_admin()
+async def export_players(interaction: discord.Interaction):
+    """匯出目前的 player.json 讓使用者可以去更新 GitHub"""
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ensure_files_exist()
+        # 直接把機器人伺服器裡的 player.json 當成檔案傳到 Discord
+        file = discord.File(PLAYER_FILE, filename="player_backup.json")
+        await interaction.followup.send("📦 這是目前的玩家名單備份！\n請下載此檔案並覆蓋到您的 GitHub Repository 中，以免重置後遺失：", file=file, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"匯出失敗：{str(e)}", ephemeral=True)
+
+@bot.tree.command(name="import_players_json", description="上傳 player.json 檔案以批次匯入玩家")
+@app_commands.describe(json_file="請上傳 .json 格式的名單檔案")
+@check_admin()
+async def import_players_json(interaction: discord.Interaction, json_file: discord.Attachment):
+    """讀取上傳的 json 檔案並合併到現有名單中"""
+    await interaction.response.defer(ephemeral=True)
+    if not json_file.filename.endswith('.json'):
+        await interaction.followup.send("❌ 錯誤：請確保上傳的是 `.json` 檔案！", ephemeral=True)
+        return
+
+    try:
+        # 讀取上傳的檔案內容
+        file_bytes = await json_file.read()
+        new_players = json.loads(file_bytes.decode('utf-8'))
+
+        ensure_files_exist()
+        with open(PLAYER_FILE, "r", encoding="utf-8") as f:
+            current_players = json.load(f)
+
+        existing_ids = {p['id'] for p in current_players}
+        added_count = 0
+
+        # 合併名單（防重複）
+        for p in new_players:
+            if 'id' in p and 'original_name' in p:
+                if p['id'] not in existing_ids:
+                    current_players.append({"id": p['id'], "original_name": p['original_name']})
+                    existing_ids.add(p['id'])
+                    added_count += 1
+
+        with open(PLAYER_FILE, "w", encoding="utf-8") as f:
+            json.dump(current_players, f, ensure_ascii=False, indent=4)
+
+        await interaction.followup.send(f"✅ 匯入成功！從檔案中成功新增了 {added_count} 名新玩家（已略過重複的 ID）。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 檔案解析錯誤：請確認檔案是標準的 JSON 格式。\n錯誤訊息: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="add_multiple_players", description="批次新增多名玩家 (直接貼上文字)")
+@app_commands.describe(players_data="格式：ID,名字 (或 ID 名字)，可以用 Shift+Enter 換行輸入多筆")
+@check_admin()
+async def add_multiple_players(interaction: discord.Interaction, players_data: str):
+    """文字輸入批次新增"""
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ensure_files_exist()
+        with open(PLAYER_FILE, "r", encoding="utf-8") as f:
+            players = json.load(f)
+
+        existing_ids = {p['id'] for p in players}
+        added_count = 0
+        lines = players_data.strip().split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            
+            # 支援逗號分隔或空白分隔
+            if ',' in line or '，' in line: # 支援全形及半形逗號
+                parts = line.replace('，', ',').split(',', 1)
+            else:
+                parts = line.split(maxsplit=1)
+                
+            if len(parts) >= 2:
+                pid = parts[0].strip()
+                pname = parts[1].strip()
+                
+                # 簡單確認 ID 是否全為數字 (白熱荒野的 ID 通常為數字)
+                if pid.isdigit() and pid not in existing_ids:
+                    players.append({"id": pid, "original_name": pname})
+                    existing_ids.add(pid)
+                    added_count += 1
+
+        with open(PLAYER_FILE, "w", encoding="utf-8") as f:
+            json.dump(players, f, ensure_ascii=False, indent=4)
+
+        await interaction.followup.send(f"✅ 批次新增完成！共成功添加了 {added_count} 名新玩家。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 發生錯誤：{str(e)}", ephemeral=True)
+
+# ===== 兌換功能 (保持原樣) =====
 
 @bot.tree.command(name="redeem", description="開始兌換禮包碼 (背景執行)")
 @app_commands.describe(code="禮包碼")
