@@ -172,11 +172,11 @@ async def import_players_json(interaction: discord.Interaction, json_file: disco
     except Exception as e:
         await interaction.followup.send(f"❌ 檔案解析錯誤：請確認檔案是標準的 JSON 格式。\n錯誤訊息: {str(e)}", ephemeral=True)
 
-@bot.tree.command(name="add_multiple_players", description="批次新增多名玩家 (直接貼上文字)")
-@app_commands.describe(players_data="格式：ID,名字 (或 ID 名字)，可以用 Shift+Enter 換行輸入多筆")
+@bot.tree.command(name="add_multiple_players", description="批次新增多名玩家 (支援單行無腦貼上)")
+@app_commands.describe(players_data="格式：ID,名字；ID 名字 (可用分號、逗號或空白隔開)")
 @check_admin()
 async def add_multiple_players(interaction: discord.Interaction, players_data: str):
-    """文字輸入批次新增"""
+    """文字輸入批次新增，支援多種分隔符號無腦貼上"""
     await interaction.response.defer(ephemeral=True)
     try:
         ensure_files_exist()
@@ -185,23 +185,31 @@ async def add_multiple_players(interaction: discord.Interaction, players_data: s
 
         existing_ids = {p['id'] for p in players}
         added_count = 0
-        lines = players_data.strip().split('\n')
+        
+        # 將全形分號與換行符號，全部統一替換成半形分號，方便一次切割
+        normalized_data = players_data.replace('\n', ';').replace('；', ';')
+        
+        # 用分號切開每個玩家的資料
+        entries = normalized_data.split(';')
 
-        for line in lines:
-            line = line.strip()
-            if not line: continue
+        for entry in entries:
+            entry = entry.strip()
+            if not entry: continue
             
-            # 支援逗號分隔或空白分隔
-            if ',' in line or '，' in line: # 支援全形及半形逗號
-                parts = line.replace('，', ',').split(',', 1)
+            # 將全形逗號、全形空白替換成半形，以利後續分割 ID 與名稱
+            entry = entry.replace('，', ',').replace('　', ' ')
+            
+            if ',' in entry:
+                parts = entry.split(',', 1)
             else:
-                parts = line.split(maxsplit=1)
+                # split(maxsplit=1) 會自動把中間多餘的空白或 Tab 當成一個分隔符號
+                # 這對直接從試算表複製貼上的格式非常友善
+                parts = entry.split(maxsplit=1)
                 
             if len(parts) >= 2:
                 pid = parts[0].strip()
                 pname = parts[1].strip()
                 
-                # 簡單確認 ID 是否全為數字 (白熱荒野的 ID 通常為數字)
                 if pid.isdigit() and pid not in existing_ids:
                     players.append({"id": pid, "original_name": pname})
                     existing_ids.add(pid)
@@ -210,7 +218,7 @@ async def add_multiple_players(interaction: discord.Interaction, players_data: s
         with open(PLAYER_FILE, "w", encoding="utf-8") as f:
             json.dump(players, f, ensure_ascii=False, indent=4)
 
-        await interaction.followup.send(f"✅ 批次新增完成！共成功添加了 {added_count} 名新玩家。", ephemeral=True)
+        await interaction.followup.send(f"✅ 批次新增完成！共成功讀取並添加了 {added_count} 名新玩家。", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ 發生錯誤：{str(e)}", ephemeral=True)
 
