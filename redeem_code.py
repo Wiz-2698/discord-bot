@@ -10,11 +10,15 @@ import json
 import sys
 import time
 import base64
-import ddddocr
 from os.path import exists
-
 import requests
 from requests.adapters import HTTPAdapter, Retry
+
+# 1. 效能優化：將 OCR 模組移至全域，啟動時僅載入一次，節省伺服器記憶體
+import ddddocr
+print("正在初始化 OCR 辨識引擎...")
+sys.stdout.flush()
+ocr = ddddocr.DdddOcr(show_ad=False)
 
 # Handle arguments
 parser = argparse.ArgumentParser()
@@ -36,7 +40,6 @@ if exists(args.results_file):
 found_item = next((result for result in results if result["code"] == args.code), None)
 
 if found_item is None:
-    # 這裡只印簡單的一行
     print(f"Start Processing Code: {args.code}") 
     new_item = {"code": args.code, "status": {}}
     results.append(new_item)
@@ -61,7 +64,7 @@ def analyze_captcha_image_and_change_2_text(base64_string):
     if "," in base64_string:
         base64_string = base64_string.split(",")[1]
     img_data = base64.b64decode(base64_string)
-    ocr = ddddocr.DdddOcr(show_ad=False)
+    # 直接呼叫全域 ocr 變數，不再重複載入模型
     res = ocr.classification(img_data)
     return res.upper()
 
@@ -69,9 +72,8 @@ def analyze_captcha_image_and_change_2_text(base64_string):
 MAX_RETRIES = 20
 retry_count = 0
 
-# 為了防止機器人斷線，我們移除單個玩家的進度條顯示，只顯示回合進度
 print(f"Target: {args.code} | Players: {len(players)} | Max Retries: {MAX_RETRIES}")
-sys.stdout.flush() # 強制發送訊息給機器人
+sys.stdout.flush()
 
 while retry_count < MAX_RETRIES:
     errors_this_round = 0
@@ -82,18 +84,15 @@ while retry_count < MAX_RETRIES:
     if not pending_players:
         break # 全部成功，直接結束
 
-    # 只印出回合開始，不印出每一個玩家
     if retry_count > 0:
         print(f"--- Retry Round {retry_count} (Left: {len(pending_players)}) ---")
         sys.stdout.flush()
 
     for player in players:
-        # Check status
         status = result["status"].get(player["id"])
         if status == "Successful" and not args.restart:
             continue
 
-        # --- 核心邏輯開始 (完全靜默執行，不 print) ---
         timestamp = time.time_ns()
         request_data = {"fid": player["id"], "time": timestamp}
         request_data["sign"] = hashlib.md5(
@@ -105,9 +104,12 @@ while retry_count < MAX_RETRIES:
             login_req = r.post(URL + "/player", data=request_data, headers=HTTP_HEADER, timeout=30)
             login_resp = login_req.json()
             if login_resp["msg"] != "success":
+                # 2. 增加具體的錯誤輸出，方便日後除錯
+                print(f"[警告] 玩家 {player['id']} 登入失敗: {login_resp}")
                 errors_this_round += 1
                 continue
-        except:
+        except Exception as e:
+            print(f"[錯誤] 玩家 {player['id']} 登入連線異常: {e}")
             errors_this_round += 1
             continue
 
@@ -121,17 +123,20 @@ while retry_count < MAX_RETRIES:
             cap_req = r.post(URL + "/captcha", data=captcha_data, headers=HTTP_HEADER, timeout=30)
             cap_resp = cap_req.json()
             if cap_resp["msg"] != "SUCCESS":
+                print(f"[警告] 玩家 {player['id']} 獲取驗證碼失敗: {cap_resp}")
                 errors_this_round += 1
                 continue
             captcha_img = cap_resp["data"]["img"]
-        except:
+        except Exception as e:
+            print(f"[錯誤] 玩家 {player['id']} 獲取驗證碼連線異常: {e}")
             errors_this_round += 1
             continue
 
         # 3. Redeem
         try:
             request_data["captcha_code"] = analyze_captcha_image_and_change_2_text(captcha_img)
-        except:
+        except Exception as e:
+            print(f"[錯誤] 玩家 {player['id']} 驗證碼辨識失敗: {e}")
             errors_this_round += 1
             continue
 
@@ -144,42 +149,43 @@ while retry_count < MAX_RETRIES:
         try:
             redeem_req = r.post(URL + "/gift_code", data=request_data, headers=HTTP_HEADER, timeout=30)
             redeem_resp = redeem_req.json()
-        except:
+        except Exception as e:
+            print(f"[錯誤] 玩家 {player['id']} 兌換連線異常: {e}")
             errors_this_round += 1
             continue
 
         # Check Result
         err_code = redeem_resp.get("err_code")
         
-        if err_code == 40014: # 不存在
+        if err_code == 40014:
             print(f"Error: Code {args.code} invalid.")
             sys.exit(1)
-        elif err_code == 40007: # 過期
+        elif err_code == 40007:
             print(f"Error: Code {args.code} expired.")
             sys.exit(1)
-        elif err_code == 40008: # 已領過
+        elif err_code == 40008:
             result["status"][player["id"]] = "Successful"
             success_this_round += 1
-        elif err_code == 20000: # 成功
+        elif err_code == 20000:
             result["status"][player["id"]] = "Successful"
             success_this_round += 1
         else:
+            print(f"[警告] 玩家 {player['id']} 兌換失敗代碼: {err_code}, 訊息: {redeem_resp}")
             result["status"][player["id"]] = "Unsuccessful"
             errors_this_round += 1
-        # --- 核心邏輯結束 ---
 
     # Save
     with open(args.results_file, "w", encoding="utf-8") as fp:
         json.dump(results, fp)
 
-    # Round Summary (這裡才印出東西)
+    # Round Summary
     if errors_this_round == 0:
         break
     else:
         retry_count += 1
         if retry_count < MAX_RETRIES:
             print(f"Round Result -> Success: {success_this_round}, Failed: {errors_this_round}. Retrying in 2s...")
-            sys.stdout.flush() # 確保訊息送出
+            sys.stdout.flush() 
             time.sleep(2)
         else:
             print(f"Stopping. Remaining Failures: {errors_this_round}")
