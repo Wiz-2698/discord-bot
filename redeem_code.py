@@ -109,7 +109,8 @@ while retry_count < MAX_RETRIES:
                 errors_this_round += 1
                 continue
         except Exception as e:
-            print(f"[錯誤] 玩家 {player['id']} 登入連線異常: {e}")
+            error_msg = login_req.text[:200] if 'login_req' in locals() else str(e)
+            print(f"[錯誤] 玩家 {player['id']} 登入連線異常。伺服器真實回傳: {error_msg}")
             errors_this_round += 1
             continue
 
